@@ -15,8 +15,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Bangun",
-  description: "Construction management",
+  title: "Nira",
+  description: "Property management",
 };
 
 export default function RootLayout({

@@ -1,3 +1,22 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// nira — Prisma Schema
+// Database: Neon (PostgreSQL)
+// ORM: Prisma 7
+//
+// Design principles:
+// - Every domain table has an orgId for multi-tenancy (Phase 3 ready from day one).
+//   Phase 1 = one org (Gregory's), seeded automatically on first login — see
+//   src/lib/auth.ts signIn callback.
+// - Reservations are channel-agnostic — source field identifies where it came from
+// - Messages are channel-agnostic — same inbox model for email, WhatsApp, OTA
+// - Sync logs track every push/pull for visibility and debugging
+// - Financial module is self-contained — expenses, ancillary revenue, and P&L live here.
+//   Lemondrop integration is a future option for company-level accounting only.
+// - User doubles as the NextAuth user model (Account/Session relations) and the
+//   staff/domain model (orgId, role). Owners are a separate model — they get their
+//   own portal login later, not staff accounts.
+// ─────────────────────────────────────────────────────────────────────────────
+
 generator client {
   provider = "prisma-client"
   output   = "../src/generated/prisma"
@@ -7,7 +26,7 @@ datasource db {
   provider = "postgresql"
 }
 
-// --- next-auth required models ---
+// ─── AUTH (NextAuth / Auth.js required models) ─────────────────────────────────
 
 model Account {
   id                String  @id @default(cuid())
@@ -36,21 +55,569 @@ model Session {
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
-model User {
-  id            String    @id @default(cuid())
-  name          String?
-  email         String?   @unique
-  emailVerified DateTime?
-  image         String?
-  accounts      Account[]
-  sessions      Session[]
-  createdAt     DateTime  @default(now())
-}
-
 model VerificationToken {
   identifier String
   token      String   @unique
   expires    DateTime
 
   @@unique([identifier, token])
+}
+
+// ─── ORGANIZATION ─────────────────────────────────────────────────────────────
+// Top-level tenant. Phase 1 = one org (Gregory's). Phase 3 = one per customer.
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  settings  Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users             User[]
+  owners            Owner[]
+  properties        Property[]
+  guests            Guest[]
+  reservations      Reservation[]
+  messages          Message[]
+  tasks             Task[]
+  syncLogs          SyncLog[]
+  notifications     Notification[]
+  expenses          Expense[]
+  ancillaryRevenues AncillaryRevenue[]
+
+  @@map("organizations")
+}
+
+// ─── USERS ────────────────────────────────────────────────────────────────────
+// Staff and admins who operate the platform day-to-day. Also the NextAuth user —
+// Account/Session relations live here so login and staff identity are the same row.
+// orgId is nullable because it doesn't exist until the signIn callback seeds the
+// default org on first login (see src/lib/auth.ts). Owners are a separate model
+// with their own login — never staff accounts.
+
+enum UserRole {
+  ADMIN  // Full access
+  STAFF  // Operational access — calendar, inbox, tasks
+}
+
+model User {
+  id            String    @id @default(cuid())
+  orgId         String?
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  role          UserRole  @default(STAFF)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  org              Organization?  @relation(fields: [orgId], references: [id])
+  accounts         Account[]
+  sessions         Session[]
+  assignedTasks    Task[]         @relation("TaskAssignee")
+  assignedMessages Message[]      @relation("MessageAssignee")
+  notifications    Notification[]
+
+  @@map("users")
+}
+
+// ─── OWNERS ───────────────────────────────────────────────────────────────────
+// Property owners — they see their own properties, bookings, and monthly statements.
+// Separate from users. Will log in via a future owner portal only.
+
+model Owner {
+  id             String   @id @default(cuid())
+  orgId          String
+  name           String
+  email          String
+  phone          String?
+  commissionRate Float    @default(0.20) // 20% default — overridable per property
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  org        Organization     @relation(fields: [orgId], references: [id])
+  properties Property[]
+  statements OwnerStatement[]
+
+  @@map("owners")
+}
+
+// ─── PROPERTIES ───────────────────────────────────────────────────────────────
+// A villa, house, or building. Has one owner. Can have multiple units.
+// staahPropertyId is null until STAAH is connected.
+
+model Property {
+  id              String   @id @default(cuid())
+  orgId           String
+  ownerId         String
+  name            String
+  address         String?
+  description     String?
+  amenities       Json     @default("[]")  // string[]
+  photos          Json     @default("[]")  // { url, caption }[]
+  staahPropertyId String?  @unique
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  org               Organization       @relation(fields: [orgId], references: [id])
+  owner             Owner              @relation(fields: [ownerId], references: [id])
+  units             Unit[]
+  tasks             Task[]
+  statements        OwnerStatement[]
+  expenses          Expense[]
+  ancillaryRevenues AncillaryRevenue[]
+
+  @@map("properties")
+}
+
+// ─── UNITS ────────────────────────────────────────────────────────────────────
+// Individual bookable rooms/villas within a property.
+// A property with one villa = one unit. A guesthouse with 4 rooms = 4 units.
+// baseRate is the default — overridden by the rates table for seasonal/special pricing.
+// staahUnitId is null until STAAH is connected.
+
+model Unit {
+  id          String   @id @default(cuid())
+  propertyId  String
+  name        String
+  type        String?  // villa, room, apartment, bungalow, etc.
+  maxGuests   Int      @default(2)
+  bedrooms    Int      @default(1)
+  bathrooms   Int      @default(1)
+  baseRate    Float
+  currency    String   @default("USD")
+  staahUnitId String?  @unique
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  property     Property      @relation(fields: [propertyId], references: [id])
+  reservations Reservation[]
+  rates        Rate[]
+  blockedDates BlockedDate[]
+  tasks        Task[]
+  expenses     Expense[]
+
+  @@map("units")
+}
+
+// ─── GUESTS ───────────────────────────────────────────────────────────────────
+// People who book. Built up over time from reservations.
+// Same guest may book multiple times — linked by email or phone.
+
+model Guest {
+  id          String   @id @default(cuid())
+  orgId       String
+  name        String
+  email       String?
+  phone       String?
+  nationality String?
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  org               Organization       @relation(fields: [orgId], references: [id])
+  reservations      Reservation[]
+  messages          Message[]
+  ancillaryRevenues AncillaryRevenue[]
+
+  @@map("guests")
+}
+
+// ─── RESERVATIONS ─────────────────────────────────────────────────────────────
+// The central table. Every booking — direct, STAAH, or any OTA — is a Reservation.
+// source identifies where it came from. externalId is the OTA/STAAH booking reference.
+// This is channel-agnostic by design.
+
+enum BookingSource {
+  DIRECT       // Entered manually or via direct booking engine
+  STAAH        // Came through STAAH sync
+  AIRBNB
+  BOOKING_COM
+  AGODA
+  VRBO
+  EXPEDIA
+  TRAVELOKA
+  TIKET
+  OTHER
+}
+
+enum ReservationStatus {
+  PENDING      // Tentative or awaiting confirmation
+  CONFIRMED    // Confirmed booking
+  CHECKED_IN   // Guest has arrived
+  CHECKED_OUT  // Guest has left
+  CANCELLED    // Cancelled
+  NO_SHOW      // Guest did not arrive
+}
+
+model Reservation {
+  id               String            @id @default(cuid())
+  orgId            String
+  unitId           String
+  guestId          String
+  source           BookingSource     @default(DIRECT)
+  externalId       String?           // OTA or STAAH booking reference number
+  status           ReservationStatus @default(CONFIRMED)
+  checkIn          DateTime
+  checkOut         DateTime
+  guestsCount      Int               @default(1)
+  totalAmount      Float
+  currency         String            @default("USD")
+  commissionAmount Float?            // What we earn from this booking
+  notes            String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  org               Organization       @relation(fields: [orgId], references: [id])
+  unit              Unit               @relation(fields: [unitId], references: [id])
+  guest             Guest              @relation(fields: [guestId], references: [id])
+  messages          Message[]
+  tasks             Task[]
+  ancillaryRevenues AncillaryRevenue[]
+
+  @@map("reservations")
+}
+
+// ─── RATES ────────────────────────────────────────────────────────────────────
+// Pricing rules per unit. Supports seasonal pricing and date-range overrides.
+// startDate/endDate null = applies always (base rate).
+// These are pushed to STAAH when updated.
+
+model Rate {
+  id          String    @id @default(cuid())
+  unitId      String
+  name        String    // "Base Rate", "High Season", "Long Stay Discount", etc.
+  amount      Float
+  currency    String    @default("USD")
+  minNights   Int       @default(1)
+  startDate   DateTime?
+  endDate     DateTime?
+  staahRateId String?   @unique // STAAH rate_id — paired with Unit.staahUnitId for push data mapping
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  unit Unit @relation(fields: [unitId], references: [id])
+
+  @@map("rates")
+}
+
+// ─── BLOCKED DATES ────────────────────────────────────────────────────────────
+// Manually blocked date ranges — owner use, maintenance, personal stays.
+// Pushed to STAAH to close availability on all channels.
+
+model BlockedDate {
+  id        String   @id @default(cuid())
+  unitId    String
+  startDate DateTime
+  endDate   DateTime
+  reason    String?
+  createdAt DateTime @default(now())
+
+  unit Unit @relation(fields: [unitId], references: [id])
+
+  @@map("blocked_dates")
+}
+
+// ─── MESSAGES ─────────────────────────────────────────────────────────────────
+// Unified inbox. Every guest message regardless of channel lives here.
+// channel identifies source. direction = inbound (from guest) or outbound (from us).
+// assignedToId lets you route conversations to specific team members.
+// This model is ready for WhatsApp — channel = WHATSAPP, wired up when API is live.
+
+enum MessageChannel {
+  EMAIL
+  WHATSAPP   // Placeholder — wired up when WhatsApp Business API is approved
+  AIRBNB
+  BOOKING_COM
+  AGODA
+  DIRECT     // Internal notes or manual messages
+}
+
+enum MessageDirection {
+  INBOUND   // From guest
+  OUTBOUND  // From us
+}
+
+enum MessageStatus {
+  UNREAD
+  READ
+  REPLIED
+}
+
+model Message {
+  id                String           @id @default(cuid())
+  orgId             String
+  reservationId     String?          // Linked to a booking if known
+  guestId           String?
+  channel           MessageChannel
+  direction         MessageDirection
+  content           String
+  status            MessageStatus    @default(UNREAD)
+  assignedToId      String?
+  externalMessageId String?          // OTA message ID for deduplication
+  sentAt            DateTime
+  createdAt         DateTime         @default(now())
+
+  org         Organization @relation(fields: [orgId], references: [id])
+  reservation Reservation? @relation(fields: [reservationId], references: [id])
+  guest       Guest?       @relation(fields: [guestId], references: [id])
+  assignedTo  User?        @relation("MessageAssignee", fields: [assignedToId], references: [id])
+
+  @@map("messages")
+}
+
+// ─── TASKS ────────────────────────────────────────────────────────────────────
+// Housekeeping, maintenance, and inspection jobs.
+// Cleaning tasks are auto-created on checkout (triggered by reservation status change).
+// Maintenance tasks are created manually.
+// photos = array of uploaded image URLs for job completion evidence.
+
+enum TaskType {
+  CLEANING
+  MAINTENANCE
+  INSPECTION
+  OTHER
+}
+
+enum TaskStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model Task {
+  id            String     @id @default(cuid())
+  orgId         String
+  propertyId    String
+  unitId        String?
+  reservationId String?    // If triggered by a checkout
+  type          TaskType   @default(CLEANING)
+  title         String
+  description   String?
+  status        TaskStatus @default(SCHEDULED)
+  assignedToId  String?
+  dueDate       DateTime?
+  completedAt   DateTime?
+  photos        Json       @default("[]")  // string[] of image URLs
+  notes         String?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  org         Organization @relation(fields: [orgId], references: [id])
+  property    Property     @relation(fields: [propertyId], references: [id])
+  unit        Unit?        @relation(fields: [unitId], references: [id])
+  reservation Reservation? @relation(fields: [reservationId], references: [id])
+  assignedTo  User?        @relation("TaskAssignee", fields: [assignedToId], references: [id])
+
+  @@map("tasks")
+}
+
+// ─── OWNER STATEMENTS ─────────────────────────────────────────────────────────
+// Monthly P&L statement per property, generated on the 1st and sent on the 10th.
+//
+// Revenue = bookingRevenue + ancillaryRevenue (owner's share of services)
+// Deductions = commission + expensesTotal
+// Net = totalRevenue - commission - expensesTotal
+//
+// expenseLineItems is a JSON snapshot of the individual expense records
+// that make up expensesTotal, so the PDF is self-contained.
+
+enum StatementStatus {
+  DRAFT   // Being prepared — review before sending
+  SENT    // Sent to owner on the 10th
+  PAID    // Payout confirmed
+}
+
+model OwnerStatement {
+  id          String          @id @default(cuid())
+  ownerId     String
+  propertyId  String
+  periodStart DateTime
+  periodEnd   DateTime
+  payoutDate  DateTime?       // Target date — always the 10th of the following month
+
+  // ── Revenue ──
+  bookingRevenue    Float           // Gross from all confirmed reservations
+  ancillaryRevenue  Float           @default(0)  // Owner's share of ancillary services
+  totalRevenue      Float           // bookingRevenue + ancillaryRevenue
+
+  // ── Deductions ──
+  commission        Float           // Management fee (bookingRevenue × commissionRate)
+  expensesTotal     Float           @default(0)  // Sum of all billable expense records
+  expenseLineItems  Json            @default("[]")  // [{ label, amount, category }] snapshot for PDF
+
+  // ── Net ──
+  netPayout         Float           // totalRevenue - commission - expensesTotal
+  currency          String          @default("USD")
+  status            StatementStatus @default(DRAFT)
+  sentAt            DateTime?
+  paidAt            DateTime?
+  notes             String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  owner    Owner    @relation(fields: [ownerId], references: [id])
+  property Property @relation(fields: [propertyId], references: [id])
+
+  @@map("owner_statements")
+}
+
+// ─── EXPENSES ─────────────────────────────────────────────────────────────────
+// All property-related costs. Two flags control visibility and billing:
+//   billableToOwner = true  → deducted from owner payout in monthly statement
+//   visibleToOwner  = true  → owner can see it in their portal (even if not billable)
+// Internal costs (management wages, software, marketing) use both flags = false.
+
+enum ExpenseCategory {
+  MAINTENANCE    // Repairs, fixes
+  UTILITIES      // Electricity, water, internet, gas
+  CLEANING       // Cleaning service fees
+  STAFF          // Local staff, gardener, security
+  SUPPLIES       // Toiletries, linens, consumables
+  POOL           // Pool service and chemicals
+  GARDEN         // Garden maintenance
+  MARKETING      // Listing fees, photography
+  INSURANCE      // Property insurance
+  TAX            // Local taxes, levies
+  OTHER
+}
+
+model Expense {
+  id               String          @id @default(cuid())
+  orgId            String
+  propertyId       String
+  unitId           String?         // null = whole-property expense
+  category         ExpenseCategory
+  description      String
+  amount           Float
+  currency         String          @default("USD")
+  date             DateTime
+  vendor           String?         // Who was paid
+  receiptUrl       String?         // Photo of receipt / invoice
+  billableToOwner  Boolean         @default(false)  // Deducted from owner payout
+  visibleToOwner   Boolean         @default(true)   // Shown in owner portal
+  notes            String?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  org      Organization @relation(fields: [orgId], references: [id])
+  property Property     @relation(fields: [propertyId], references: [id])
+  unit     Unit?        @relation(fields: [unitId], references: [id])
+
+  @@map("expenses")
+}
+
+// ─── ANCILLARY REVENUE ────────────────────────────────────────────────────────
+// Extra revenue from services: drivers, day trips, airport transfers, tours, etc.
+// Each record has an explicit ownerAmount and managementAmount.
+// ownerAmount = 0 means management keeps everything.
+// ownerAmount > 0 means it appears as additional revenue on the owner's statement.
+// The split is set per transaction, not per category — some airport transfers may
+// be 100% management, others 50/50 depending on the agreement.
+
+enum AncillaryType {
+  DRIVER
+  AIRPORT_TRANSFER
+  DAY_TRIP
+  TOUR
+  BOAT_TRIP
+  EQUIPMENT_RENTAL
+  LAUNDRY
+  MEAL
+  SPA
+  OTHER
+}
+
+model AncillaryRevenue {
+  id               String        @id @default(cuid())
+  orgId            String
+  propertyId       String?       // null = company-wide service (not property-specific)
+  reservationId    String?       // Link to guest booking if this was for a staying guest
+  guestId          String?
+  type             AncillaryType
+  description      String
+  totalAmount      Float         // Full amount charged to guest
+  currency         String        @default("USD")
+  ownerAmount      Float         @default(0)  // Owner's share — added to their statement
+  managementAmount Float         // Management's share — kept by company
+  date             DateTime
+  notes            String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  org         Organization @relation(fields: [orgId], references: [id])
+  property    Property?    @relation(fields: [propertyId], references: [id])
+  reservation Reservation? @relation(fields: [reservationId], references: [id])
+  guest       Guest?       @relation(fields: [guestId], references: [id])
+
+  @@map("ancillary_revenue")
+}
+
+// ─── SYNC LOGS ────────────────────────────────────────────────────────────────
+// Every sync attempt is logged — success or failure.
+// Used for the sync health dashboard and debugging.
+// triggeredBy tells you if it was automatic (webhook/cron) or manual.
+
+enum SyncSource {
+  STAAH
+  MANUAL
+}
+
+enum SyncType {
+  BOOKING_PULL       // We pulled new bookings from STAAH
+  RATE_PUSH          // We pushed a rate change to STAAH
+  AVAILABILITY_PUSH  // We pushed blocked dates / availability to STAAH
+}
+
+enum SyncStatus {
+  SUCCESS
+  FAILED
+  PARTIAL  // Some records succeeded, some failed
+}
+
+enum SyncTrigger {
+  WEBHOOK  // Triggered by incoming webhook from STAAH
+  CRON     // Triggered by scheduled job
+  MANUAL   // Triggered by user clicking "Sync now"
+}
+
+model SyncLog {
+  id               String      @id @default(cuid())
+  orgId            String
+  source           SyncSource
+  type             SyncType
+  status           SyncStatus
+  recordsProcessed Int         @default(0)
+  errorMessage     String?
+  staahTrackingId  String?     // STAAH's trackingId from the push payload — use for debugging failed syncs
+  triggeredBy      SyncTrigger
+  createdAt        DateTime    @default(now())
+
+  org Organization @relation(fields: [orgId], references: [id])
+
+  @@map("sync_logs")
+}
+
+// ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
+// In-app notifications for staff.
+// type examples: new_booking | task_assigned | sync_failed | message_received | checkout_today
+
+model Notification {
+  id        String   @id @default(cuid())
+  orgId     String
+  userId    String
+  type      String
+  title     String
+  body      String?
+  read      Boolean  @default(false)
+  metadata  Json     @default("{}")  // Flexible — link to reservation, task, etc.
+  createdAt DateTime @default(now())
+
+  org  Organization @relation(fields: [orgId], references: [id])
+  user User         @relation(fields: [userId], references: [id])
+
+  @@map("notifications")
 }
